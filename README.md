@@ -45,3 +45,5 @@ news-bot/
 - Jadwal GitHub Actions bisa terlambat 5–15 menit saat server GitHub sibuk.
 - GitHub menonaktifkan jadwal otomatis jika repo publik tidak ada aktivitas selama 60 hari. Cukup buka tab Actions dan aktifkan lagi, atau buat commit kecil.
 - Database `news.db` disimpan lewat cache Actions. Jika cache terhapus, run berikutnya dianggap run pertama (menyimpan tanpa mengirim), jadi tidak terjadi pengiriman dobel.
+
+bot aktif
