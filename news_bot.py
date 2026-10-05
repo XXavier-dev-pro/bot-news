@@ -1,37 +1,57 @@
 """
 News Bot - Xavier Trade
-Mengambil berita dari RSS dan mengirim berita baru ke channel Discord #news-update.
+Mengambil berita dari banyak sumber (via Google News RSS) dan mengirim
+berita baru ke channel Discord #news-update.
 """
 import os, sys, time, sqlite3
+from urllib.parse import quote_plus
 import feedparser, requests
 
 WEBHOOK = os.environ.get("WEBHOOK_NEWS")
 DB = "news.db"
 
-FEEDS = {
-    "CNBC Indonesia": "https://www.cnbcindonesia.com/market/rss",
-    "Kontan": "https://rss.kontan.co.id/news/investasi",
+# Topik berita yang dicari
+TOPIK = "saham OR IHSG OR emiten OR bursa OR dividen"
+
+# Sumber berita: nama tampilan -> domain situs
+SUMBER = {
+    "CNBC Indonesia": "cnbcindonesia.com",
+    "Kontan": "kontan.co.id",
+    "Bisnis.com": "bisnis.com",
+    "Investor.id": "investor.id",
+    "IDX Channel": "idxchannel.com",
+    "Detik Finance": "finance.detik.com",
+    "Kompas Money": "money.kompas.com",
+    "CNN Indonesia": "cnnindonesia.com",
+    "Liputan6": "liputan6.com",
+    "Emiten News": "emitennews.com",
+    "Stockbit Snips": "snips.stockbit.com",
 }
 
-KEYWORDS = ["saham", "ihsg", "emiten", "bursa", "bei", "dividen", "investor"]
-MAX_KIRIM_PER_RUN = 15
+KEYWORDS = ["saham", "ihsg", "emiten", "bursa", "bei", "dividen", "investor",
+            "ipo", "rights issue", "buyback", "laba", "kinerja"]
+MAX_KIRIM_PER_RUN = 10
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+
+
+def url_feed(domain):
+    q = quote_plus(f"({TOPIK}) site:{domain} when:1d")
+    return f"https://news.google.com/rss/search?q={q}&hl=id&gl=ID&ceid=ID:id"
+
+
+def bersihkan_judul(judul):
+    # Google News menambahkan " - Nama Sumber" di akhir judul
+    return judul.rsplit(" - ", 1)[0].strip()
 
 
 def relevan(judul):
     return not KEYWORDS or any(k in judul.lower() for k in KEYWORDS)
 
 
-def ambil_feed(url):
-    r = requests.get(url, headers=HEADERS, timeout=15)
-    print(f"  HTTP {r.status_code}, {len(r.content)} bytes")
-    r.raise_for_status()
-    return feedparser.parse(r.content).entries
-
-
 def kirim(judul, link, sumber):
-    embed = {"title": judul[:256], "url": link, "color": 0x3498DB, "footer": {"text": sumber}}
+    embed = {"title": judul[:256], "url": link, "color": 0x3498DB,
+             "footer": {"text": sumber}}
     try:
         r = requests.post(WEBHOOK, json={"embeds": [embed]}, timeout=10)
         if r.status_code == 429:
@@ -50,43 +70,56 @@ def main():
         sys.exit("WEBHOOK_NEWS belum diset di GitHub Secrets.")
 
     run_pertama = not os.path.exists(DB)
-    print("Run pertama" if run_pertama else "Database ditemukan (bukan run pertama)")
+    print("Run pertama" if run_pertama else "Database ditemukan")
 
     con = sqlite3.connect(DB)
     con.execute("CREATE TABLE IF NOT EXISTS news (link TEXT PRIMARY KEY, judul TEXT, "
                 "sumber TEXT, waktu_simpan TEXT DEFAULT CURRENT_TIMESTAMP)")
 
-    terkirim = 0
-    for sumber, url in FEEDS.items():
-        print(f"[{sumber}]")
+    # Kumpulkan berita baru dari semua sumber
+    antrian = []
+    for nama, domain in SUMBER.items():
         try:
-            entries = ambil_feed(url)
+            r = requests.get(url_feed(domain), headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            entries = feedparser.parse(r.content).entries
         except Exception as e:
-            print(f"  Gagal ambil: {e}")
+            print(f"[{nama}] gagal: {e}")
             continue
 
-        baru = lolos = 0
-        for e in reversed(entries):
+        baru = 0
+        for e in entries:
             link, judul = e.get("link"), e.get("title")
             if not link or not judul:
                 continue
-            cur = con.execute("INSERT OR IGNORE INTO news (link, judul, sumber) VALUES (?,?,?)",
-                              (link, judul, sumber))
-            if cur.rowcount != 1:
-                continue
-            baru += 1
-            if run_pertama or not relevan(judul):
-                continue
-            lolos += 1
-            if terkirim < MAX_KIRIM_PER_RUN and kirim(judul, link, sumber):
-                terkirim += 1
-                time.sleep(1)
+            judul = bersihkan_judul(judul)
 
-        print(f"  {len(entries)} berita di feed, {baru} baru, {lolos} lolos filter")
+            # Lewati jika link ATAU judul yang sama sudah pernah tersimpan
+            sudah_ada = con.execute("SELECT 1 FROM news WHERE link=? OR judul=?",
+                                    (link, judul)).fetchone()
+            if sudah_ada:
+                continue
+            con.execute("INSERT INTO news (link, judul, sumber) VALUES (?,?,?)",
+                        (link, judul, nama))
+            baru += 1
+            if not run_pertama and relevan(judul):
+                waktu = e.get("published_parsed") or time.gmtime(0)
+                antrian.append((waktu, judul, link, nama))
+
+        print(f"[{nama}] {len(entries)} di feed, {baru} baru")
 
     con.commit()
+
+    # Kirim dari yang terlama ke terbaru
+    antrian.sort(key=lambda x: x[0])
+    terkirim = 0
+    for _, judul, link, nama in antrian[-MAX_KIRIM_PER_RUN:]:
+        if kirim(judul, link, nama):
+            terkirim += 1
+            time.sleep(1)
+
     con.close()
-    print(f"Selesai. {terkirim} berita terkirim.")
+    print(f"{len(antrian)} lolos filter, {terkirim} terkirim.")
 
 
 if __name__ == "__main__":
